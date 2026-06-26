@@ -125,7 +125,7 @@
   <name>QmlBackend</name>
   <message>
     <source>FreeKill</source>
-    <translation>新月杀</translation>
+    <translation>狐狸杀</translation>
   </message>
   <message>
     <source>help: others logged in again with this name</source>
@@ -169,7 +169,7 @@
   <name>Init</name>
   <message>
     <source>FreeKill</source>
-    <translation>新月杀</translation>
+    <translation>狐狸杀</translation>
   </message>
   <message>
     <source>Join Server</source>
@@ -324,7 +324,7 @@
   <name>main</name>
   <message>
     <source>FreeKill</source>
-    <translation>新月杀</translation>
+    <translation>狐狸杀</translation>
   </message>
   <message>
     <source>Are you sure to exit?</source>
@@ -336,7 +336,7 @@
   <name>Splash</name>
   <message>
     <source>FreeKill</source>
-    <translation>新月杀</translation>
+    <translation>狐狸杀</translation>
   </message>
   <message>
     <source>Free</source>

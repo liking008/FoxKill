@@ -6,6 +6,9 @@ on:
     tags:
       - '*'
 
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
 jobs:
   build:
     name: Build Android APK
@@ -14,7 +17,7 @@ jobs:
     steps:
 
     - name: Checkout Git Repo
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
         submodules: true
 
@@ -58,7 +61,7 @@ jobs:
         cp -r android_openssl/ssl_3/arm64-v8a/libcrypto_3.so .
         cp -r android_openssl/ssl_3/arm64-v8a/libssl_3.so .
 
-        cd ../FreeKill
+        cd ../FoxKill
         cp -r ../openssl-3.1.8/include/openssl ./include
 
     #- name: Setup Debug Session
@@ -129,7 +132,6 @@ jobs:
         cd assets/res
         cp -r /etc/ssl/certs .
         cp /usr/share/ca-certificates/mozilla/* certs/
-        curl https://raw.githubusercontent.com/Qsgs-Fans/freekill-server-list/master/server-list.json > server-list.json
         cd ../..
         echo ${FKVER%)} > ../fk_ver
         ../genfkver.sh
@@ -161,7 +163,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Git Repo
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
         fetch-depth: 0
 
@@ -177,28 +179,29 @@ jobs:
         name: apk
         path: apk
 
-    - uses: r0adkll/sign-android-release@v1
-      name: Sign app APK
-      # ID used to access action output
-      id: sign_app
-      with:
-        releaseDirectory: apk
-        signingKeyBase64: ${{ secrets.KEY_STORE }}
-        alias: ${{ secrets.KEY_STORE_ALIAS }}
-        keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-      env:
-        # override default build-tools version (29.0.3) -- optional
-        BUILD_TOOLS_VERSION: "34.0.0"
+    # - uses: r0adkll/sign-android-release@v1
+    #   name: Sign app APK
+    #   # ID used to access action output
+    #   id: sign_app
+    #   with:
+    #     releaseDirectory: apk
+    #     signingKeyBase64: ${{ secrets.KEY_STORE }}
+    #     alias: ${{ secrets.KEY_STORE_ALIAS }}
+    #     keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+    #   # env:
+    #     # override default build-tools version (29.0.3) -- optional
+    #     # BUILD_TOOLS_VERSION: "34.0.0"
+    #     # JAVA_TOOL_OPTIONS: "-Dkeystore.pkcs12.legacy"
 
     - name: Rename APK
       run: |
         mv ${{ steps.sign_app.outputs.signedReleaseFile }} \
-          apk/FreeKill-${{ steps.previoustag.outputs.tag }}.apK
+          apk/FoxKill-${{ steps.previoustag.outputs.tag }}.apK
 
     - name: Upload Release APK
       uses: softprops/action-gh-release@v1
       with:
         token: ${{ secrets.MY_TOKEN }}
         tag_name: ${{ steps.previoustag.outputs.tag }}
-        files: apk/FreeKill-${{ steps.previoustag.outputs.tag }}.apK
+        files: apk/FoxKill-${{ steps.previoustag.outputs.tag }}.apK
 
