@@ -37,6 +37,8 @@ cp ../en_US.qm assets/res
 cp ../vi_VN.qm assets/res
 cp ../fk_ver assets/res
 cp ../waiting_tips.txt assets/res
+cp ../server-list.json assets/res
+cp -r ../resource_pak assets/res
 
 # Due to Qt Android's bug, we need make sure every directory has a subfile (not subdir)
 function fixDir() {
