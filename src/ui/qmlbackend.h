@@ -72,7 +72,15 @@ public:
 
   Q_INVOKABLE QJsonObject getRequestData() const;
 
+  Q_PROPERTY(QString quickStartMode READ quickStartMode NOTIFY quickStartModeChanged)
+  QString quickStartMode() const { return m_quickStartMode; }
+  void setQuickStartMode(const QString &mode) { m_quickStartMode = mode; emit quickStartModeChanged(); }
+
+  QVariantMap quickStartConfig() const { return m_quickStartConfig; }
+  void setQuickStartConfig(const QVariantMap &config) { m_quickStartConfig = config; }
+
 signals:
+  void quickStartModeChanged();
   void notifyUI(const QString &command, const QVariant &data);
   void dialog(const QString &type, const QString &text, const QString &orig = QString());
   void volumeChanged(qreal);
@@ -95,6 +103,8 @@ private:
   int maxConcurrentPlayback = 13;
 
   Replayer *replayer;
+  QString m_quickStartMode;
+  QVariantMap m_quickStartConfig;
 #endif
 };
 

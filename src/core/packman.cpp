@@ -2,6 +2,7 @@
 
 #include <git2.h>
 #include <git2/errors.h>
+#include <algorithm>
 #include "core/packman.h"
 #include "core/c-wrapper.h"
 #include "core/util.h"
@@ -40,6 +41,16 @@ PackMan::~PackMan() {
   git_libgit2_shutdown();
 }
 
+// RAII wrapper for libgit2 git_repository
+struct PackMan::GitRepo {
+  git_repository *repo = nullptr;
+
+  GitRepo() noexcept = default;
+  GitRepo(GitRepo &) = delete;
+  GitRepo(GitRepo &&) = delete;
+  ~GitRepo() { if (repo) git_repository_free(repo); }
+};
+
 QStringList PackMan::getDisabledPacks() {
   return disabled_packs;
 }
@@ -69,6 +80,9 @@ void PackMan::loadSummary(const QString &jsonData, bool useThread) {
       Backend->notifyUI("SetDownloadingPackage", name);
 #endif
 
+      // 先尝试一下令DB与磁盘状态一致，再决定clone还是pull
+      sanitize_package_db(name);
+
       if (db->select(
               QString("SELECT name FROM packages WHERE name='%1';").arg(name))
               .isEmpty()) {
@@ -90,7 +104,8 @@ void PackMan::loadSummary(const QString &jsonData, bool useThread) {
 
       enablePack(name);
 
-      if (head(name) != obj["hash"].toString()) {
+      GitRepo head_repo;
+      if (open(name, head_repo) == 0 && head(head_repo.repo) != obj["hash"].toString()) {
         err = updatePack(name, obj["hash"].toString());
         if (err != 0) {
 #ifndef FK_SERVER_ONLY
@@ -133,23 +148,19 @@ int PackMan::downloadNewPack(const QString &url, bool useThread) {
       VALUES ('%1','%2','%3',1);");
 
   auto threadFunc = [=, this] {
-    int err = clone(url);
-    // if (err < 0) {
-    //   return err;
-    // }
-
-    auto u = url;
-    while (u.endsWith('/')) {
-      u.chop(1);
+    GitRepo raii_repo;
+    int err = clone(url, raii_repo);
+    if (err < 0) {
+      sanitize_package_db(extract_pack_name(url));
+      return err;
     }
-    QString fileName = QUrl(u).fileName();
-    if (fileName.endsWith(".git"))
-      fileName.chop(4);
+
+    auto fileName = extract_pack_name(url);
 
     auto result = db->select(sql_select.arg(fileName));
     if (result.isEmpty()) {
       db->exec(sql_update.arg(fileName).arg(url)
-                      .arg(err < 0 ? "XXXXXXXX" : head(fileName)));
+                      .arg(head(raii_repo.repo)));
     }
 
     return err;
@@ -177,6 +188,11 @@ void PackMan::enablePack(const QString &pack) {
 }
 
 void PackMan::disablePack(const QString &pack) {
+  if (pack == "freekill-core") {
+    qWarning("Package 'freekill-core' cannot be disabled.");
+    return;
+  }
+
   db->exec(
     QString("UPDATE packages SET enabled = 0 WHERE name = '%1';").arg(pack));
 
@@ -185,43 +201,64 @@ void PackMan::disablePack(const QString &pack) {
 }
 
 int PackMan::updatePack(const QString &pack, const QString &hash) {
-  int err;
+  GitRepo raii_repo;
+  int err = open(pack, raii_repo);
+  if (err < 0) {
+    sanitize_package_db(pack);
+    return err;
+  }
+  auto repo = raii_repo.repo;
+
   // 先status 检查dirty 后面全是带--force的操作
-  err = status(pack);
+  err = status(repo);
   if (err != 0)
     return err;
 
   // 检测一下是否已经存在该commit hash，不存在就pull
-  err = hasCommit(pack, hash);
+  err = hasCommit(repo, hash);
   if (err != 0) {
-    err = pull(pack);
+    err = pull(repo);
     if (err < 0)
       return err;
   }
-  err = checkout(pack, hash);
+  err = checkout(repo, hash);
   if (err < 0)
     return err;
   return 0;
 }
 
 int PackMan::upgradePack(const QString &pack) {
-  int err;
+  GitRepo raii_repo;
+  int err = open(pack, raii_repo);
+  if (err < 0) {
+    sanitize_package_db(pack);
+    return err;
+  }
+  auto repo = raii_repo.repo;
+
   // 先status 检查dirty 后面全是带--force的操作
-  err = status(pack);
+  err = status(repo);
   if (err != 0)
     return err;
-  err = pull(pack);
+
+  auto old_hash = head(repo);
+
+  err = pull(repo);
   if (err < 0)
     return err;
   // 至此upgrade命令把包升到了FETCH_HEAD的commit
   // 我们稍微操作一下，让HEAD指向最新的master
   // 这样以后就能开新分支干活了
-  err = checkout_branch(pack, "master");
+  err = checkout_branch(repo, "master");
   if (err < 0)
     return err;
 
+  auto hash = head(repo);
+  auto commit_range = QString("%1..%2").arg(old_hash, hash);
+  generate_changelog(repo, commit_range);
+
   db->exec(QString("UPDATE packages SET hash = '%1' WHERE name = '%2';")
-                  .arg(head(pack))
+                  .arg(head(repo))
                   .arg(pack));
   return 0;
 }
@@ -244,14 +281,26 @@ QString PackMan::listPackages() {
 }
 
 void PackMan::forceCheckoutMaster(const QString &pack) {
-  checkout_branch(pack, "master");
+  GitRepo repo;
+  int err = open(pack, repo);
+  if (err < 0) {
+    sanitize_package_db(pack);
+    return;
+  }
+  checkout_branch(repo.repo, "master");
 }
 
 void PackMan::syncCommitHashToDatabase() {
   for (auto e : db->select("SELECT name FROM packages;")) {
     auto pack = e["name"];
+    GitRepo repo;
+    int err = open(pack, repo);
+    if (err < 0) {
+      sanitize_package_db(pack);
+      continue;
+    }
     db->exec(QString("UPDATE packages SET hash = '%1' WHERE name = '%2';")
-             .arg(head(pack))
+             .arg(head(repo.repo))
              .arg(pack));
   }
 }
@@ -336,6 +385,18 @@ bool PackMan::shouldUseCore() {
     goto clean;        \
   }
 
+int PackMan::open(const QString &name, GitRepo &repo) {
+  git_repository *raw = nullptr;
+  auto path = QString("packages/%1").arg(name).toUtf8();
+  int err = git_repository_open(&raw, path);
+  if (err < 0) {
+    GIT_FAIL;
+    return err;
+  }
+  repo.repo = raw;
+  return 0;
+}
+
 static int transfer_progress_cb(const git_indexer_progress *stats,
                                 void *payload) {
   if (Backend == nullptr) {
@@ -378,40 +439,31 @@ static int transfer_progress_cb(const git_indexer_progress *stats,
   return 0;
 }
 
-int PackMan::clone(const QString &u) {
-  git_repository *repo = NULL;
-  auto url = u;
-  while (url.endsWith('/')) {
-    url.chop(1);
-  }
-  QString fileName = QUrl(url).fileName();
-  if (fileName.endsWith(".git"))
-    fileName.chop(4);
-  fileName = QStringLiteral("packages/") + fileName;
+int PackMan::clone(const QString &u, GitRepo &repo) {
+  QString fileName = extract_pack_name(u);
+  QString clonePath = QString("packages/%1").arg(fileName);
 
+  git_repository *raw = nullptr;
   git_clone_options opt;
   git_clone_init_options(&opt, GIT_CLONE_OPTIONS_VERSION);
   opt.fetch_opts.proxy_opts.version = 1;
   opt.fetch_opts.callbacks.transfer_progress = transfer_progress_cb;
-  int err = git_clone(&repo, url.toUtf8(), fileName.toUtf8(), &opt);
+  int err = git_clone(&raw, u.toUtf8(), clonePath.toUtf8(), &opt);
   if (err < 0) {
+    QDir(clonePath).removeRecursively();
     GIT_FAIL;
-    // QDir(fileName).removeRecursively();
-    // QDir(".").rmdir(fileName);
   } else {
+    repo.repo = raw;
     if (Backend == nullptr)
       printf("\n");
   }
-  git_repository_free(repo);
   return err;
 }
 
 // git fetch && git checkout FETCH_HEAD -f
-int PackMan::pull(const QString &name) {
-  git_repository *repo = NULL;
+int PackMan::pull(git_repository *repo) {
   int err;
   git_remote *remote = NULL;
-  auto path = QString("packages/%1").arg(name).toUtf8();
   git_fetch_options opt;
   git_fetch_init_options(&opt, GIT_FETCH_OPTIONS_VERSION);
   opt.proxy_opts.version = 1;
@@ -419,9 +471,6 @@ int PackMan::pull(const QString &name) {
 
   git_checkout_options opt2 = GIT_CHECKOUT_OPTIONS_INIT;
   opt2.checkout_strategy = GIT_CHECKOUT_FORCE;
-
-  err = git_repository_open(&repo, path);
-  GIT_CHK_CLEAN;
 
   // first git fetch origin
   err = git_remote_lookup(&remote, repo, "origin");
@@ -442,20 +491,15 @@ int PackMan::pull(const QString &name) {
 
 clean:
   git_remote_free(remote);
-  git_repository_free(repo);
   return err;
 }
 
-int PackMan::hasCommit(const QString &name, const QString &hash) {
-  git_repository *repo = NULL;
+int PackMan::hasCommit(git_repository *repo, const QString &hash) {
   int err;
   git_oid oid = {0};
   git_commit *commit = NULL;
 
-  auto path = QString("packages/%1").arg(name).toUtf8();
   auto sha = hash.toLatin1();
-  err = git_repository_open(&repo, path);
-  GIT_CHK_CLEAN;
   err = git_oid_fromstr(&oid, sha);
   GIT_CHK_CLEAN;
   err = git_commit_lookup(&commit, repo, &oid);
@@ -464,20 +508,15 @@ int PackMan::hasCommit(const QString &name, const QString &hash) {
 
 clean:
   git_commit_free(commit);
-  git_repository_free(repo);
   return err;
 }
 
-int PackMan::checkout(const QString &name, const QString &hash) {
-  git_repository *repo = NULL;
+int PackMan::checkout(git_repository *repo, const QString &hash) {
   int err;
   git_oid oid = {0};
   git_checkout_options opt = GIT_CHECKOUT_OPTIONS_INIT;
   opt.checkout_strategy = GIT_CHECKOUT_FORCE;
-  auto path = QString("packages/%1").arg(name).toUtf8();
   auto sha = hash.toLatin1();
-  err = git_repository_open(&repo, path);
-  GIT_CHK_CLEAN;
   err = git_oid_fromstr(&oid, sha);
   GIT_CHK_CLEAN;
   err = git_repository_set_head_detached(repo, &oid);
@@ -486,13 +525,11 @@ int PackMan::checkout(const QString &name, const QString &hash) {
   GIT_CHK_CLEAN;
 
 clean:
-  git_repository_free(repo);
   return err;
 }
 
 // git checkout -B branch origin/branch --force
-int PackMan::checkout_branch(const QString &name, const QString &branch) {
-  git_repository *repo = NULL;
+int PackMan::checkout_branch(git_repository *repo, const QString &branch) {
   git_oid oid = {0};
   int err;
   git_object *obj = NULL;
@@ -504,11 +541,6 @@ int PackMan::checkout_branch(const QString &name, const QString &branch) {
 
   QString local_branch;
   QString remote_branch;
-
-  // 打开仓库
-  auto path = QString("packages/%1").arg(name).toUtf8();
-  err = git_repository_open(&repo, path);
-  GIT_CHK_CLEAN;
 
   // 查找远程分支的引用 (refs/remotes/origin/branch)
   remote_branch = QString("refs/remotes/origin/%1").arg(branch);
@@ -549,20 +581,15 @@ clean:
   git_reference_free(branch_ref);
   git_reference_free(remote_ref);
   git_object_free(obj);
-  git_repository_free(repo);
 
   return err;
 }
 
-int PackMan::status(const QString &name) {
-  git_repository *repo = NULL;
+int PackMan::status(git_repository *repo) {
   int err;
   git_status_list *status_list = NULL;
   size_t i, maxi;
   const git_status_entry *s;
-  auto path = QString("packages/%1").arg(name).toUtf8();
-  err = git_repository_open(&repo, path);
-  GIT_CHK_CLEAN;
   err = git_status_list_new(&status_list, repo, NULL);
   GIT_CHK_CLEAN;
   maxi = git_status_list_entrycount(status_list);
@@ -571,7 +598,27 @@ int PackMan::status(const QString &name) {
     s = git_status_byindex(status_list, i);
     if (s->status != GIT_STATUS_CURRENT && s->status != GIT_STATUS_IGNORED) {
       git_status_list_free(status_list);
-      git_repository_free(repo);
+      status_list = NULL;
+
+      // 如果是程序设置HEAD后未checkout导致，index和workdir之间没有diff，可以自动恢复
+      git_diff *diff = NULL;
+      git_diff_options diff_opts = GIT_DIFF_OPTIONS_INIT;
+      if (git_diff_index_to_workdir(&diff, repo, NULL, &diff_opts) == 0) {
+        size_t num_deltas = git_diff_num_deltas(diff);
+        git_diff_free(diff);
+        if (num_deltas == 0) {
+          git_checkout_options checkout_opts = GIT_CHECKOUT_OPTIONS_INIT;
+          checkout_opts.checkout_strategy = GIT_CHECKOUT_FORCE;
+          err = git_checkout_head(repo, &checkout_opts);
+          if (err == 0) {
+            qInfo("Auto-recovered from interrupted set_head.");
+            return 0;
+          }
+          GIT_FAIL;
+          return err;
+        }
+      }
+
       qCritical("Workspace is dirty.");
       return 100;
     }
@@ -579,32 +626,189 @@ int PackMan::status(const QString &name) {
 
 clean:
   git_status_list_free(status_list);
-  git_repository_free(repo);
   return err;
 }
 
-QString PackMan::head(const QString &name) {
-  git_repository *repo = NULL;
+QString PackMan::head(git_repository *repo) {
   int err;
   git_object *obj = NULL;
   const git_oid *oid;
   char buf[42] = {0};
-  auto path = QString("packages/%1").arg(name).toUtf8();
-  err = git_repository_open(&repo, path);
-  GIT_CHK_CLEAN;
   err = git_revparse_single(&obj, repo, "HEAD");
   GIT_CHK_CLEAN;
 
   oid = git_object_id(obj);
   git_oid_tostr(buf, 41, oid);
   git_object_free(obj);
-  git_repository_free(repo);
   return QString(buf);
 
 clean:
   git_object_free(obj);
-  git_repository_free(repo);
   return QString("0000000000000000000000000000000000000000");
+}
+
+struct ConvCommit {
+  QString raw_message_head;
+  enum { Feat, Fix } type;
+  bool breaking = false;
+  QString subtype;
+  QString message_title;
+};
+
+// 根据Conventional Commit规范，对于给定commit_range生成摘要
+// 但是实际上是简化版方法，只检测feat: 和 fix:，以及他俩携带括号的版本和携带感叹号的版本
+// 比如feat(foo)!: message title\n\n  LONG MESSAGE BODY
+// 这单独一条显示为 - **破坏性!** (foo) message title
+QString PackMan::generate_changelog(git_repository *repo, const QString &commit_range) {
+  int err;
+  git_revwalk *walk = NULL;
+  git_oid oid;
+  QList<ConvCommit> feats;
+  QList<ConvCommit> fixes;
+  QString result;
+
+  err = git_revwalk_new(&walk, repo);
+  GIT_CHK_CLEAN;
+
+  err = git_revwalk_push_range(walk, commit_range.toUtf8());
+  GIT_CHK_CLEAN;
+
+  while (!git_revwalk_next(&oid, walk)) {
+    git_commit *commit = NULL;
+    err = git_commit_lookup(&commit, repo, &oid);
+    if (err < 0) continue;
+
+    const char *msg = git_commit_message(commit);
+    QString msg_str(msg);
+    auto first_line = msg_str.left(msg_str.indexOf('\n'));
+    if (first_line.isEmpty())
+      first_line = msg_str;
+
+    ConvCommit cc;
+    cc.raw_message_head = first_line;
+
+    int pos = 0;
+    if (first_line.startsWith("feat")) {
+      cc.type = ConvCommit::Feat;
+      pos = 4;
+    } else if (first_line.startsWith("fix")) {
+      cc.type = ConvCommit::Fix;
+      pos = 3;
+    } else {
+      git_commit_free(commit);
+      continue;
+    }
+
+    if (pos < first_line.size() && first_line[pos] == '(') {
+      int end = first_line.indexOf(')', pos);
+      if (end != -1) {
+        cc.subtype = first_line.mid(pos + 1, end - pos - 1);
+        pos = end + 1;
+      }
+    }
+
+    if (pos < first_line.size() && first_line[pos] == '!') {
+      cc.breaking = true;
+      pos++;
+    }
+
+    if (pos < first_line.size() && first_line[pos] == ':') {
+      pos++;
+      if (pos < first_line.size() && first_line[pos] == ' ') {
+        pos++;
+      }
+    }
+
+    cc.message_title = first_line.mid(pos);
+
+    if (cc.type == ConvCommit::Feat) {
+      feats.append(cc);
+    } else {
+      fixes.append(cc);
+    }
+
+    git_commit_free(commit);
+  }
+
+  std::reverse(feats.begin(), feats.end());
+  std::reverse(fixes.begin(), fixes.end());
+
+  if (!feats.isEmpty()) {
+    result += "## Feature(s)\n\n";
+    for (const auto &c : feats) {
+      result += "- ";
+      if (c.breaking) {
+        result += "**BREAKING!** ";
+      }
+      if (!c.subtype.isEmpty()) {
+        result += "(" + c.subtype + ") ";
+      }
+      result += c.message_title + "\n";
+    }
+    result += "\n";
+  }
+
+  if (!fixes.isEmpty()) {
+    result += "## Fix(es)\n\n";
+    for (const auto &c : fixes) {
+      result += "- ";
+      if (c.breaking) {
+        result += "**BREAKING!** ";
+      }
+      if (!c.subtype.isEmpty()) {
+        result += "(" + c.subtype + ") ";
+      }
+      result += c.message_title + "\n";
+    }
+    result += "\n";
+  }
+
+clean:
+  git_revwalk_free(walk);
+  return result;
+}
+
+QString PackMan::extract_pack_name(const QString &u) {
+  auto url = u;
+  while (url.endsWith('/')) {
+    url.chop(1);
+  }
+  QString fileName = QUrl(url).fileName();
+  if (fileName.endsWith(".git"))
+    fileName.chop(4);
+  return fileName;
+}
+
+void PackMan::sanitize_package_db(const QString &packname) {
+  QString dirPath = QString("packages/%1").arg(packname);
+  QDir dir(dirPath);
+  bool dirExists = dir.exists();
+
+  auto result = db->select(QString("SELECT name FROM packages WHERE name='%1';").arg(packname));
+  bool dbHasRecord = !result.isEmpty();
+
+  if (!dirExists && dbHasRecord) {
+    db->exec(QString("DELETE FROM packages WHERE name='%1';").arg(packname));
+    return;
+  }
+
+  if (dirExists && !dbHasRecord) {
+    GitRepo repo;
+    if (open(packname, repo) != 0)
+      return;
+
+    git_remote *remote = NULL;
+    QString url;
+    if (git_remote_lookup(&remote, repo.repo, "origin") == 0) {
+      url = QString::fromUtf8(git_remote_url(remote));
+      git_remote_free(remote);
+    }
+
+    QString hash = head(repo.repo);
+
+    db->exec(QString("INSERT INTO packages (name,url,hash,enabled) VALUES ('%1','%2','%3',1);")
+             .arg(packname).arg(url).arg(hash));
+  }
 }
 
 #undef GIT_FAIL

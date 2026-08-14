@@ -12,6 +12,7 @@
 # IDE & LSP
 /.kdev4/
 /.vscode/
+/.qtcreator
 /*.user
 *-swp
 /*.kdev4
@@ -27,6 +28,8 @@
 /mymod
 /recording
 freekill-wrap.cxx
+/compile_commands.json
+/quick_start.json
 /server/*
 !/server/init.sql
 !/server/gamedb_init.sql
@@ -59,3 +62,4 @@ freekill-wrap.cxx
 /translations/
 /*.dll
 /*.bat
+build.ps1

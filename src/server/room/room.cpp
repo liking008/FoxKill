@@ -104,7 +104,7 @@ void Room::setOwner(ServerPlayer *owner) {
   this->owner = owner;
   if (!owner) return;
   QCborArray arr { owner->getId() };
-  doBroadcastNotify(players, "RoomOwner", arr.toCborValue().toCbor());
+  broadcast("RoomOwner", arr.toCborValue().toCbor());
 }
 
 void Room::addPlayer(ServerPlayer *player) {
@@ -137,7 +137,7 @@ void Room::addPlayer(ServerPlayer *player) {
     player->isReady(),
     player->getTotalGameTime(),
   };
-  doBroadcastNotify(getPlayers(), "AddPlayer", arr.toCborValue().toCbor());
+  broadcast("AddPlayer", arr.toCborValue().toCbor());
 
   players.append(player);
   player->setRoom(this);
@@ -169,6 +169,17 @@ void Room::addPlayer(ServerPlayer *player) {
     player->doNotify("UpdateGameData", arr.toCborValue().toCbor());
   }
 
+  for (auto p : observers) {
+    arr = {
+      p->getId(),
+      p->getScreenName(),
+      p->getAvatar(),
+      false,
+      p->getTotalGameTime(),
+    };
+    player->doNotify("AddObserver", arr.toCborValue().toCbor());
+  }
+
   if (this->owner != nullptr) {
     arr = { this->owner->getId() };
     player->doNotify("RoomOwner", arr.toCborValue().toCbor());
@@ -182,7 +193,7 @@ void Room::addPlayer(ServerPlayer *player) {
     for (int i : player->getGameData()) {
       arr << i;
     }
-    doBroadcastNotify(getPlayers(), "UpdateGameData", arr.toCborValue().toCbor());
+    broadcast("UpdateGameData", arr.toCborValue().toCbor());
   }
 }
 
@@ -221,7 +232,7 @@ void Room::removePlayer(ServerPlayer *player) {
     }
     emit playerRemoved(player);
 
-    doBroadcastNotify(getPlayers(), "RemovePlayer", QCborArray({ player->getId() }).toCborValue().toCbor());
+    broadcast("RemovePlayer", QCborArray({ player->getId() }).toCborValue().toCbor());
   } else {
     // 否则给跑路玩家召唤个AI代打
     // TODO: if the player is died..
@@ -284,22 +295,54 @@ void Room::removePlayer(ServerPlayer *player) {
 }
 
 void Room::addObserver(ServerPlayer *player) {
-  // 首先只能旁观在运行的房间，因为旁观是由Lua处理的
-  if (!gameStarted) {
-    player->doNotify("ErrorMsg", "Can only observe running room.");
-    return;
-  }
-
   if (rejected_players.contains(player->getId())) {
     player->doNotify("ErrorMsg", "rejected your demand of joining room");
     return;
+  }
+
+  // 先告诉大家
+  if (!gameStarted) {
+    const auto bytes = QCborArray {
+      player->getId(),
+      player->getScreenName(),
+      player->getAvatar(),
+      false, // player->isReady(),
+      player->getTotalGameTime(),
+    }.toCborValue().toCbor();
+    broadcast("AddObserver", bytes);
   }
 
   // 向observers中追加player，并从大厅移除player，然后将player的room设为this
   observers.append(player);
   player->setRoom(this);
   emit playerAdded(player);
-  pushRequest(QString("%1,observe").arg(player->getId()));
+
+  if (gameStarted) {
+    // 交给Lua处理后续内容
+    // TODO: (v0.6) 将AddObserver统一到cpp
+    pushRequest(QString("%1,observe").arg(player->getId()));
+  } else {
+    // 简单的tellRoomToObserver环节 有点像addPlayer
+    QCborMap obsSettings(settings_obj);
+    QCborArray playerList, observerList;
+    for (auto p : players) {
+	    playerList << QCborArray { p->getId(), p->getScreenName(), p->getAvatar(),
+        p->isReady(), p->getTotalGameTime(), (p == owner) };
+	  }
+    for (auto p : observers) {
+	    observerList << QCborArray { p->getId(), p->getScreenName(), p->getAvatar(), false, p->getTotalGameTime() };
+	  }
+    obsSettings[QStringLiteral("isObserver")] = true;
+    obsSettings[QStringLiteral("_players")] = playerList;
+	  obsSettings[QStringLiteral("_observers")] = observerList;
+    player->doNotify("EnterRoom", QCborArray {
+      capacity, timeout, obsSettings
+    }.toCborValue().toCbor());
+
+ 	  if (owner) {
+	    player->doNotify("RoomOwner", QCborArray { owner->getId() } .toCborValue().toCbor());
+	  }
+  }
 }
 
 void Room::removeObserver(ServerPlayer *player) {
@@ -316,7 +359,13 @@ void Room::removeObserver(ServerPlayer *player) {
     };
     player->doNotify("Setup", arr.toCborValue().toCbor());
   }
-  pushRequest(QString("%1,leave").arg(player->getId()));
+
+  if (gameStarted) {
+    // TODO: (v0.6) 将AddObserver统一到cpp
+    pushRequest(QString("%1,leave").arg(player->getId()));
+  } else {
+    broadcast("RemoveObserver", QCborArray { player->getId() }.toCborValue().toCbor());
+  }
 }
 
 QList<ServerPlayer *> Room::getObservers() const { return observers; }
@@ -339,6 +388,11 @@ bool Room::isOutdated() {
 }
 
 bool Room::isStarted() const { return gameStarted; }
+
+void Room::broadcast(const QByteArray &command, const QByteArray &data) {
+  doBroadcastNotify(players, command, data);
+  doBroadcastNotify(observers, command, data);
+}
 
 static const QString findPWinRate =
     QString("SELECT win, lose, draw "
@@ -607,7 +661,7 @@ void Room::manuallyStart() {
       if (i.value().length() <= 1) continue;
       auto warn = QString("*WARN* Same IP address: [%1]").arg(i.value().join(", "));
       auto warnUtf8 = warn.toUtf8();
-      doBroadcastNotify(getPlayers(), "ServerMessage", warnUtf8);
+      broadcast("ServerMessage", warnUtf8);
       qInfo("%s", warnUtf8.constData());
     }
 
@@ -615,7 +669,7 @@ void Room::manuallyStart() {
       if (i.value().length() <= 1) continue;
       auto warn = QString("*WARN* Same device id: [%1]").arg(i.value().join(", "));
       auto warnUtf8 = warn.toUtf8();
-      doBroadcastNotify(getPlayers(), "ServerMessage", warnUtf8);
+      broadcast("ServerMessage", warnUtf8);
       qInfo("%s", warnUtf8.constData());
     }
 
@@ -655,6 +709,7 @@ void Room::addRobotRequest(ServerPlayer *player, const QByteArray &) {
 void Room::kickPlayer(ServerPlayer *player, const QByteArray &jsonData) {
   int i = QCborValue::fromCbor(jsonData).toInteger();
   auto p = findPlayer(i);
+  if (!p) p = findObserver(i);
   if (p && !isStarted()) {
     removePlayer(p);
     addRejectId(i);
@@ -723,12 +778,71 @@ void Room::changeRoom(ServerPlayer *player, const QByteArray &jsonData) {
   setTimeout(newtimeout);
   setSettings(newsettings);
 
-  doBroadcastNotify(players, "ChangeRoom", jsonData);
+  broadcast("ChangeRoom", jsonData);
 
   // 按官服 修改配置后所有人重新准备
   for (auto &p : players) {
     if (!p) continue;
     p->setReady(false);
+  }
+}
+
+void Room::switchToPlayer(ServerPlayer *player, const QByteArray &) {
+  if (gameStarted) return;
+  if (!observers.contains(player)) return;
+  if (isFull()) {
+    player->doNotify("ErrorMsg", "Room is full");
+    return;
+  }
+
+  observers.removeOne(player);
+  players.append(player);
+  broadcast("SwitchToPlayer", QCborArray { player->getId() }.toCborValue().toCbor());
+  player->setReady(false);
+
+  // 树上下来的人在客户端没有胜率和时长需要补发一下
+  auto mode = settings_obj["gameMode"_L1].toString();
+  if (player->getLastGameMode() != mode) {
+    player->setLastGameMode(mode);
+    updatePlayerGameData(player->getId(), mode);
+  }
+  QCborArray arr = { player->getId() };
+  for (int i : player->getGameData()) {
+    arr << i;
+  }
+  broadcast("UpdateGameData", arr.toCborValue().toCbor());
+}
+
+void Room::switchToObserver(ServerPlayer *player, const QByteArray &) {
+  if (gameStarted) return;
+  if (!players.contains(player)) return;
+
+  ServerPlayer *candidate = nullptr;
+  if (player == owner) {
+    // 从剩余真实玩家中找个人接任房主
+    for (auto p : players) {
+      if (p == player) continue;
+      if (p->getState() == Player::Robot) continue;
+      if (!candidate) {
+        candidate = p;
+        break;
+      }
+    }
+
+    // 没有真实玩家可以接任房主，不允许旁观
+    if (!candidate) {
+      player->doNotify("ErrorMsg", "Room owner cannot spectate: no eligible player");
+      return;
+    }
+  }
+
+  players.removeOne(player);
+  observers.append(player);
+  broadcast("SwitchToObserver", QCborArray { player->getId() }.toCborValue().toCbor());
+  player->setReady(false);
+
+  if (player == owner) {
+    setOwner(candidate);
   }
 }
 
@@ -745,6 +859,8 @@ void Room::handlePacket(ServerPlayer *sender, const QByteArray &command,
     {"Trust", &Room::trust},
     {"ChangeRoom", &Room::changeRoom},
     {"Chat", &Room::chat},
+    {"SwitchToPlayer", &Room::switchToPlayer},
+    {"SwitchToObserver", &Room::switchToObserver},
   };
 
   if (command == "PushRequest") {
