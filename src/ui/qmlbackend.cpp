@@ -6,21 +6,18 @@
 
 #ifndef FK_SERVER_ONLY
 #include <QAudioOutput>
+#include <QNetworkAccessManager>
 #include <QNetworkDatagram>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QDnsLookup>
 
 #include <QClipboard>
 #include <QMediaPlayer>
 #include <QMessageBox>
 #include <QAbstractButton>
-#include <QAtomicInt>
+#include <QLibrary>
 #include <QtConcurrent>
-
-#ifdef Q_OS_WIN
-#include <windows.h>
-#include <mmsystem.h>
-#pragma comment(lib, "winmm.lib")
-#endif
 #endif
 
 #include <cstdlib>
@@ -114,6 +111,83 @@ QJsonObject QmlBackend::readJsonObjectFromFile(const QString &file) {
   }
 
   return jsonDoc.object();
+}
+
+namespace {
+
+QString assetsRootPath() {
+  return QDir::currentPath() + QStringLiteral("/assets");
+}
+
+// 将 path 解析为 assets 目录内的绝对路径，若越界或非法则返回空串
+QString resolveAssetsPath(const QString &path) {
+  QString p = path;
+#ifdef Q_OS_WIN
+  if (p.startsWith("file:///"))
+    p.replace(0, 8, "file://");
+#endif
+  p = QUrl(p).path();
+  if (p.isEmpty())
+    return QString();
+
+  const QString root = QDir::cleanPath(assetsRootPath());
+  const QString abs = QDir::cleanPath(QDir(root).absoluteFilePath(p));
+  if (abs != root && !abs.startsWith(root + QLatin1Char('/')))
+    return QString();
+  return abs;
+}
+
+} // namespace
+
+QString QmlBackend::readFileFromAssets(const QString &path) {
+  const QString abs = resolveAssetsPath(path);
+  if (abs.isEmpty()) {
+    qWarning() << "Assets path out of bounds:" << path;
+    return QString();
+  }
+
+  QFile f(abs);
+  if (!f.open(QIODevice::ReadOnly)) {
+    qWarning() << "Failed to open assets file for reading:" << abs;
+    return QString();
+  }
+  return QString::fromUtf8(f.readAll());
+}
+
+bool QmlBackend::writeFileToAssets(const QString &path, const QString &content) {
+  const QString abs = resolveAssetsPath(path);
+  if (abs.isEmpty()) {
+    qWarning() << "Assets path out of bounds:" << path;
+    return false;
+  }
+
+  if (!QDir().mkpath(QFileInfo(abs).absolutePath())) {
+    qWarning() << "Failed to create parent directory:" << abs;
+    return false;
+  }
+
+  QFile f(abs);
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    qWarning() << "Failed to open assets file for writing:" << abs;
+    return false;
+  }
+  f.write(content.toUtf8());
+  f.close();
+  return true;
+}
+
+bool QmlBackend::existsInAssets(const QString &path) {
+  const QString abs = resolveAssetsPath(path);
+  return !abs.isEmpty() && QFile::exists(abs);
+}
+
+bool QmlBackend::removeFileFromAssets(const QString &path) {
+  const QString abs = resolveAssetsPath(path);
+  if (abs.isEmpty()) {
+    qWarning() << "Assets path out of bounds:" << path;
+    return false;
+  }
+  return QFile::remove(abs);
 }
 
 #ifndef FK_SERVER_ONLY
@@ -276,6 +350,74 @@ void QmlBackend::saveConf(const QString &conf) {
   c.close();
 }
 
+void QmlBackend::downloadFileToAssets(const QString &url,
+                                      const QString &path) {
+  const QString abs = resolveAssetsPath(path);
+  if (abs.isEmpty()) {
+    qWarning() << "Assets path out of bounds:" << path;
+    emit assetsDownloadFinished(false, path, tr("Invalid path"));
+    return;
+  }
+
+  auto *manager = new QNetworkAccessManager(this);
+  QNetworkRequest request{QUrl(url)};
+  request.setHeader(QNetworkRequest::UserAgentHeader,
+                    "FreeKill Asset Download");
+  auto *reply = manager->get(request);
+
+  connect(reply, &QNetworkReply::finished, this, [=, this]() {
+    if (reply->error() != QNetworkReply::NoError) {
+      const QString err = reply->errorString();
+      qWarning() << "Download failed:" << err;
+      emit assetsDownloadFinished(false, path, err);
+      reply->deleteLater();
+      manager->deleteLater();
+      return;
+    }
+
+    QString err;
+    if (!QDir().mkpath(QFileInfo(abs).absolutePath())) {
+      err = tr("Failed to create directory");
+    } else {
+      QFile f(abs);
+      if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        err = tr("Failed to open file for writing");
+      } else {
+        f.write(reply->readAll());
+        f.close();
+      }
+    }
+
+    emit assetsDownloadFinished(err.isEmpty(), path, err);
+    reply->deleteLater();
+    manager->deleteLater();
+  });
+}
+
+// 静默 FFmpeg 刷屏的日志（仅保留 error 级别）
+static void silenceFfmpegLogs() {
+  // AV_LOG_ERROR = 16，屏蔽 warning/info/debug
+  const QStringList candidates = {
+#ifdef Q_OS_WIN
+    QStringLiteral("avutil-59"), QStringLiteral("avutil-58"),
+    QStringLiteral("avutil-57"),
+#else
+    QStringLiteral("avutil"),
+#endif
+  };
+  for (const auto &name : candidates) {
+    QLibrary lib(name);
+    if (!lib.load()) continue;
+    using AvLogSetLevel = void (*)(int);
+    auto setLevel =
+        reinterpret_cast<AvLogSetLevel>(lib.resolve("av_log_set_level"));
+    if (setLevel) {
+      setLevel(16);
+      return;
+    }
+  }
+}
+
 void QmlBackend::playSound(const QString &name, int index) {
   QString fname(name);
   if (index == -1) {
@@ -302,44 +444,11 @@ void QmlBackend::playSound(const QString &name, int index) {
   QJniObject::callStaticMethod<void>("org/notify/FreeKill/Helper", "PlaySound",
       "(Ljava/lang/String;F)V", QJniObject::fromString(fname).object<jstring>(),
       (float)(m_volume / 100));
-#elif defined(Q_OS_WIN)
-  // 使用 Windows MCI 播放，避免 QMediaPlayer(WMF) 对高码率MP3支持不佳的问题
-  // 每个音效用唯一别名支持并发播放
-  if (maxConcurrentPlayback < 0) return;
-  static QAtomicInt sfxCounter(0);
-  int id = sfxCounter.fetchAndAddRelaxed(1) % 100000;
-  QString alias = QString("fk_sfx_%1").arg(id);
-  QString abs = QDir::toNativeSeparators(QFileInfo(fname).absoluteFilePath());
-
-  QString cmdOpen = QString("open \"%1\" type mpegvideo alias %2").arg(abs, alias);
-  if (mciSendStringW((LPCWSTR)cmdOpen.utf16(), NULL, 0, NULL) != 0)
-    return;
-
-  QString cmdVolume = QString("setaudio %1 volume to %2")
-                          .arg(alias).arg((int)(m_volume * 10));
-  mciSendStringW((LPCWSTR)cmdVolume.utf16(), NULL, 0, NULL);
-
-  mciSendStringW((LPCWSTR)QString("play %1 from 0").arg(alias).utf16(), NULL, 0, NULL);
-  maxConcurrentPlayback--;
-
-  // 轮询播放状态，结束后清理
-  auto timer = new QTimer(this);
-  timer->setInterval(300);
-  connect(timer, &QTimer::timeout, this, [=]() mutable {
-    wchar_t buf[64] = {0};
-    mciSendStringW((LPCWSTR)QString("status %1 mode").arg(alias).utf16(), buf, 63, NULL);
-    if (wcscmp(buf, L"playing") != 0) {
-      mciSendStringW((LPCWSTR)QString("close %1").arg(alias).utf16(), NULL, 0, NULL);
-      timer->stop();
-      timer->deleteLater();
-      maxConcurrentPlayback++;
-    }
-  });
-  timer->start();
 #else
   if (maxConcurrentPlayback < 0) return;
   auto player = new QMediaPlayer;
   auto output = new QAudioOutput;
+  silenceFfmpegLogs(); // 后端已加载，静默 FFmpeg 的 warning/info 日志
   maxConcurrentPlayback--;
 
   player->setAudioOutput(output);
