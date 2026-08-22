@@ -6,7 +6,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(FreeKill VERSION 0.5.21)
+project(FreeKill VERSION 0.5.22)
 add_definitions(-DFK_VERSION=\"${CMAKE_PROJECT_VERSION}\")
 
 find_package(Qt6 REQUIRED COMPONENTS
@@ -88,6 +88,17 @@ add_custom_command(
   COMMAND echo ${CMAKE_PROJECT_VERSION} > ${PROJECT_SOURCE_DIR}/fk_ver
   COMMAND ${PROJECT_SOURCE_DIR}/genfkver.sh
 )
+
+if (NOT DEFINED FK_SERVER_ONLY)
+  # 部署 Spine QML 模块到 build/qml/Spine（与 Qt 模块并列，供 IDE 解析 import Spine 1.0）
+  # 用 ALL 自定义目标：每次构建都执行，避免 QML 文件修改后因 exe 未重链而不更新
+  add_custom_target(deploy_spine_qml ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+      "${PROJECT_SOURCE_DIR}/src/ui/spine/Spine"
+      "${PROJECT_BINARY_DIR}/qml/Spine"
+    COMMENT "Deploying Spine QML module to build/qml/Spine"
+  )
+endif ()
 
 add_subdirectory(src)
 
