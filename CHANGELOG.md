@@ -1,5 +1,15 @@
 # ChangeLog
 
+## 0.5.23
+
+### 新功能
+
+- *(windows)* 音频播放改用 SoLoud 引擎替代 ffmpeg，低延迟且支持短音效并发叠加
+
+### Bug修复
+
+- *(android/linux)* 修复 Spine 骨骼无法显示的问题
+
 ## 0.5.22
 
 ### 新功能
