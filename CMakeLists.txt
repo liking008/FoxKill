@@ -6,7 +6,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(FreeKill VERSION 0.5.23)
+project(FreeKill VERSION 0.5.24)
 add_definitions(-DFK_VERSION=\"${CMAKE_PROJECT_VERSION}\")
 
 find_package(Qt6 REQUIRED COMPONENTS
@@ -16,12 +16,14 @@ find_package(Qt6 REQUIRED COMPONENTS
 if (NOT DEFINED FK_SERVER_ONLY)
   find_package(Qt6 REQUIRED COMPONENTS
     Gui
+    GuiPrivate
     Qml
     Quick
     Widgets
     Multimedia
     QuickControls2
     Concurrent
+    ShaderTools
     LinguistTools
   )
 else ()
