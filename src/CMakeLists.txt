@@ -282,13 +282,18 @@ endif()
 if (TARGET Qt6::ShaderTools AND Qt6ShaderTools_DIR)
   get_filename_component(QT6_PREFIX "${Qt6ShaderTools_DIR}/../../.." ABSOLUTE)
   set(QT6_PRIV_VER "${Qt6_VERSION_MAJOR}.${Qt6_VERSION_MINOR}.${Qt6_VERSION_PATCH}")
-  if (EXISTS "${QT6_PREFIX}/include/QtShaderTools/${QT6_PRIV_VER}/QtShaderTools/rhi/qshaderbaker.h")
-    target_include_directories(libFreeKill PRIVATE
-      "${QT6_PREFIX}/include/QtShaderTools/${QT6_PRIV_VER}/QtShaderTools")
-  elseif (EXISTS "${QT6_PREFIX}/include/QtShaderTools/rhi/qshaderbaker.h")
-    target_include_directories(libFreeKill PRIVATE
-      "${QT6_PREFIX}/include/QtShaderTools")
-  endif()
+  # 遍历常见布局（Debian 用 include/，Arch 用 include/qt6/），
+  # 找到真实存在 rhi/qshaderbaker.h 的目录后再附加，避免路径猜错
+  foreach (_sub IN ITEMS
+      "include/QtShaderTools/${QT6_PRIV_VER}/QtShaderTools"
+      "include/qt6/QtShaderTools/${QT6_PRIV_VER}/QtShaderTools"
+      "include/QtShaderTools"
+      "include/qt6/QtShaderTools")
+    if (EXISTS "${QT6_PREFIX}/${_sub}/rhi/qshaderbaker.h")
+      target_include_directories(libFreeKill PRIVATE "${QT6_PREFIX}/${_sub}")
+      break()
+    endif ()
+  endforeach ()
 endif()
 
 target_precompile_headers(libFreeKill PRIVATE "pch.h")
